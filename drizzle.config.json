@@ -1,0 +1,7 @@
+{
+  "dialect": "postgresql",
+  "schema": "./src/db/schema.ts",
+  "dbCredentials": {
+    "url": "postgresql://velvet_vault:velvet_vault@127.0.0.1:5432/velvet_vault"
+  }
+}

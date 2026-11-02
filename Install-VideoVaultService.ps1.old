@@ -1,0 +1,285 @@
+
+param(
+    [ValidateSet("Install", "Start", "Stop", "Restart", "Status", "Uninstall")]
+    [string]$Action = "Install"
+)
+
+$ErrorActionPreference = "Stop"
+
+# ==========================================
+# VIDEO VAULT - WINDOWS SERVICE CONFIGURATION
+# ==========================================
+
+$ServiceName = "VideoVault"
+$DisplayName = "Video Vault"
+$ProjectPath = "D:\scripts\OptionB"
+
+$DataPath = "$env:ProgramData\VideoVault"
+$LogPath = "$DataPath\logs"
+$NssmPath = "$DataPath\nssm.exe"
+
+$ServiceDescription = "Video Vault Node.js Application - Port 3000"
+
+# ==========================================
+# ADMINISTRATOR CHECK
+# ==========================================
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+if (-not $principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    Write-Host "Administrator privileges required." -ForegroundColor Yellow
+
+    $scriptPath = $MyInvocation.MyCommand.Path
+
+    Start-Process powershell.exe -Verb RunAs -ArgumentList @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "`"$scriptPath`"",
+        "-Action", $Action
+    )
+
+    exit
+}
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+
+function Write-Status($Message, $Color = "Cyan") {
+    Write-Host "`n[VIDEO VAULT] $Message" -ForegroundColor $Color
+}
+
+function Get-Nssm {
+    if (Test-Path $NssmPath) {
+        return $NssmPath
+    }
+
+    Write-Status "Downloading NSSM..."
+
+    New-Item -ItemType Directory -Force -Path $DataPath | Out-Null
+
+    $zipPath = "$env:TEMP\nssm.zip"
+    $extractPath = "$env:TEMP\nssm_extract"
+
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.SecurityProtocolType]::Tls12
+
+    Invoke-WebRequest `
+        -Uri "https://nssm.cc/release/nssm-2.24.zip" `
+        -OutFile $zipPath
+
+    Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+    $architecture = if ([Environment]::Is64BitOperatingSystem) {
+        "win64"
+    } else {
+        "win32"
+    }
+
+    $source = Join-Path $extractPath "nssm-2.24\$architecture\nssm.exe"
+
+    if (!(Test-Path $source)) {
+        throw "NSSM executable was not found in the downloaded archive."
+    }
+
+    Copy-Item $source $NssmPath -Force
+
+    Remove-Item $zipPath -Force
+    Remove-Item $extractPath -Recurse -Force
+
+    return $NssmPath
+}
+
+function Get-ServiceObject {
+    return Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+}
+
+# ==========================================
+# INSTALL
+# ==========================================
+
+function Install-VideoVault {
+
+    Write-Status "Installing Video Vault..."
+
+    if (!(Test-Path "$ProjectPath\package.json")) {
+        throw "package.json not found in $ProjectPath"
+    }
+
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+
+    if (!$npm) {
+        throw "npm.cmd not found. Install Node.js and ensure it is in PATH."
+    }
+
+    $npmPath = $npm.Source
+
+    if (!$npmPath) {
+        $npmPath = $npm.Path
+    }
+
+    $nssm = Get-Nssm
+
+    New-Item -ItemType Directory -Force -Path $LogPath | Out-Null
+
+    # Remove existing service if already installed
+    if (Get-ServiceObject) {
+        Write-Status "Existing service found. Removing it..."
+
+        & $nssm stop $ServiceName confirm 2>$null
+        Start-Sleep -Seconds 2
+
+        & $nssm remove $ServiceName confirm
+
+        Start-Sleep -Seconds 2
+    }
+
+    # Register service
+    Write-Status "Registering Windows service..."
+
+    & $nssm install $ServiceName $env:ComSpec
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to register Video Vault service."
+    }
+
+    # Configure application
+    $parameters = '/d /s /c "' + '"' + $npmPath + '" start -- --port 3000"'
+
+    & $nssm set $ServiceName DisplayName $DisplayName
+    & $nssm set $ServiceName Description $ServiceDescription
+
+    & $nssm set $ServiceName AppDirectory $ProjectPath
+    & $nssm set $ServiceName AppParameters $parameters
+
+    # Automatic startup
+    & $nssm set $ServiceName Start SERVICE_AUTO_START
+
+    # Restart if application exits
+    & $nssm set $ServiceName AppExit Default Restart
+    & $nssm set $ServiceName AppRestartDelay 5000
+
+    # Logging
+    & $nssm set $ServiceName AppStdout "$LogPath\stdout.log"
+    & $nssm set $ServiceName AppStderr "$LogPath\stderr.log"
+
+    & $nssm set $ServiceName AppRotateFiles 1
+    & $nssm set $ServiceName AppRotateBytes 10485760
+
+    # Start service
+    Write-Status "Starting Video Vault..."
+
+    & $nssm start $ServiceName
+
+    Start-Sleep -Seconds 3
+
+    Get-ServiceObject | Format-List Name, DisplayName, Status
+
+    Write-Status "Installation completed!" Green
+
+    Write-Host "Service: Video Vault"
+    Write-Host "Project: $ProjectPath"
+    Write-Host "Port:    3000"
+    Write-Host "Logs:    $LogPath"
+}
+
+# ==========================================
+# START
+# ==========================================
+
+function Start-VideoVault {
+    $nssm = Get-Nssm
+    & $nssm start $ServiceName
+    Write-Status "Video Vault started." Green
+}
+
+# ==========================================
+# STOP
+# ==========================================
+
+function Stop-VideoVault {
+    $nssm = Get-Nssm
+    & $nssm stop $ServiceName
+    Write-Status "Video Vault stopped." Yellow
+}
+
+# ==========================================
+# RESTART
+# ==========================================
+
+function Restart-VideoVault {
+    $nssm = Get-Nssm
+    & $nssm restart $ServiceName
+    Write-Status "Video Vault restarted." Green
+}
+
+# ==========================================
+# STATUS
+# ==========================================
+
+function Show-VideoVaultStatus {
+
+    $service = Get-ServiceObject
+
+    if (!$service) {
+        Write-Status "Service is not installed." Red
+        return
+    }
+
+    $service | Format-List Name, DisplayName, Status, StartType
+
+    Write-Host "`nApplication URL: http://localhost:3000"
+    Write-Host "Log directory:   $LogPath"
+
+    if (Test-Path "$LogPath\stderr.log") {
+        Write-Host "`nRecent errors:"
+        Get-Content "$LogPath\stderr.log" -Tail 10
+    }
+}
+
+# ==========================================
+# UNINSTALL
+# ==========================================
+
+function Uninstall-VideoVault {
+
+    $nssm = Get-Nssm
+
+    Write-Status "Uninstalling Video Vault..."
+
+    if (Get-ServiceObject) {
+        & $nssm stop $ServiceName confirm 2>$null
+        Start-Sleep -Seconds 2
+
+        & $nssm remove $ServiceName confirm
+    }
+
+    Write-Status "Video Vault service removed." Green
+    Write-Host "Application files and logs have been preserved."
+}
+
+# ==========================================
+# ACTION ROUTER
+# ==========================================
+
+try {
+
+    switch ($Action) {
+
+        "Install"   { Install-VideoVault }
+        "Start"     { Start-VideoVault }
+        "Stop"      { Stop-VideoVault }
+        "Restart"   { Restart-VideoVault }
+        "Status"    { Show-VideoVaultStatus }
+        "Uninstall" { Uninstall-VideoVault }
+
+    }
+
+}
+catch {
+    Write-Status "ERROR: $_" Red
+    exit 1
+}
